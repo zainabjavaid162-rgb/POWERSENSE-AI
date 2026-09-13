@@ -637,8 +637,39 @@ def ai_recommendations(units_now):
     return recs
 
 
+def index_pdf_into_rag(uploaded_file, raw_text, label):
+    """Chunks freshly-extracted PDF text and adds it to the session's RAG
+    index (same TF-IDF index the AI Assistant and suggestions draw from),
+    so an uploaded bill or document is immediately searchable — not just
+    regex-parsed for a handful of fields."""
+    if not raw_text or not raw_text.strip():
+        return False
+    already = any(c.get("_source_file") == uploaded_file.name for c in st.session_state.custom_kb_chunks)
+    if already:
+        return True
+    new_chunks = [
+        {"title": label, "category": "Your Documents", "text": c, "_source_file": uploaded_file.name}
+        for c in _chunk_text(raw_text)
+    ]
+    st.session_state.custom_kb_chunks.extend(new_chunks)
+    return True
+
+
+def _secret_groq_key():
+    """Checks st.secrets (Streamlit Cloud's standard secret store) without
+    raising if no secrets.toml exists locally."""
+    try:
+        return st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        return ""
+
+
 def get_groq_client():
-    api_key = st.session_state.get("groq_api_key") or os.environ.get("GROQ_API_KEY")
+    api_key = (
+        st.session_state.get("groq_api_key")
+        or os.environ.get("GROQ_API_KEY")
+        or _secret_groq_key()
+    )
     if not api_key or not GROQ_AVAILABLE:
         return None
     try:
@@ -709,6 +740,66 @@ def ai_chat_response(user_message):
         )
         sources = []
     return text, sources, "retrieval"
+
+
+def ai_llm_savings_suggestions(bill_data, rule_based_recs):
+    """Generates a personalized, LLM-written savings plan via Groq, grounded
+    in the user's actual bill data plus whatever the RAG index retrieves —
+    including any uploaded bill/document PDFs, not just the built-in
+    Knowledge Center. Falls back to None if no key is configured or the
+    call fails, so the caller can show the rule-based plan instead."""
+    client = get_groq_client()
+    if client is None:
+        return None
+
+    retrieved = rag_search(
+        "reduce electricity bill save energy tips appliances peak hours", k=4, min_score=0.0
+    )
+    context_block = "\n\n".join(f"Source: {r['title']}\n{r['text']}" for r in retrieved) \
+        or "No specific knowledge-base passages retrieved."
+    rule_lines = "\n".join(f"- {r['title']}: {r['impact']}, est. saving {r['saving']}" for r in rule_based_recs)
+
+    bill_summary = (
+        f"Units consumed this month: {bill_data.get('units_consumed', current_units)} kWh. "
+        f"Total payable: Rs. {bill_data.get('total_payable', current_bill):,}. "
+        f"Previous month units: {previous_units} kWh. Change: {pct_change:+.1f}%. "
+        f"Tariff rate in use: Rs. {RATE_PER_UNIT}/kWh."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=st.session_state.get("llm_model", "llama-3.3-70b-versatile"),
+            max_tokens=500,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are PowerSense AI's savings advisor. Using ONLY the bill data, "
+                        "the baseline calculated recommendations, and the knowledge-base "
+                        "context given, write a short, specific, personalized savings plan "
+                        "(4-6 bullet points, each one line, each with a rough Rs./month "
+                        "impact where sensible). Ground every claim in the data given — do "
+                        "not invent appliances or numbers the user hasn't mentioned. End "
+                        "with one sentence on the single highest-impact action."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Bill data:\n{bill_summary}\n\n"
+                        f"Baseline calculated recommendations:\n{rule_lines}\n\n"
+                        f"Knowledge base / uploaded document context:\n{context_block}\n\n"
+                        "Write the personalized savings plan."
+                    ),
+                },
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        sources = [r["title"] for r in retrieved]
+        return (text, sources) if text else None
+    except Exception as e:
+        st.session_state["_last_llm_error"] = str(e)
+        return None
 
 
 # ----------------------------------------------------------------------
@@ -864,6 +955,10 @@ elif page == "🧾 Bill Analyzer":
             try:
                 data = ai_extract_bill(uploaded)
                 st.session_state.bill_data = data
+                if uploaded is not None and "pdf" in (getattr(uploaded, "type", "") or ""):
+                    raw_text = extract_text_from_pdf(uploaded)
+                    if index_pdf_into_rag(uploaded, raw_text, f"Your Bill — {uploaded.name}"):
+                        st.session_state.pop("rag_index", None)  # force reindex with new chunks
             except Exception as e:
                 st.error(f"Couldn't process that file ({e}). Showing demo data instead.")
                 st.session_state.bill_data = ai_extract_bill(None)
@@ -946,6 +1041,12 @@ elif page == "🧾 Bill Analyzer":
         st.markdown("**💡 What you can do**")
         st.info("Reducing AC usage by approximately 1 hour/day could potentially reduce "
                  "monthly consumption by 15–20 units.")
+
+        if any(c.get("_source_file") for c in st.session_state.custom_kb_chunks):
+            st.caption("📎 Your uploaded bill's text has been indexed into the RAG "
+                       "knowledge base — the AI Assistant and Recommendations page can "
+                       "now ground answers in it too.")
+        st.caption("👉 Head to **💡 Recommendations** for a full personalized savings plan.")
     else:
         st.caption("Upload a bill above, or click 'Use sample bill for demo' to see the analysis flow.")
 
@@ -1049,6 +1150,31 @@ elif page == "💡 Recommendations":
     st.write("")
     st.success(f"Combined, these changes could save up to **Rs. {total_saving:,}/month** "
                f"(~Rs. {total_saving*12:,}/year).")
+
+    st.divider()
+    st.markdown("#### 🧠 AI-Generated Personalized Plan")
+    if get_groq_client() is None:
+        st.caption("💡 Add a Groq API key in Settings to generate a personalized, "
+                   "LLM-written plan grounded in your bill data and (if uploaded) your "
+                   "own bill PDF. Showing the calculated plan above either way.")
+    else:
+        st.caption("Grounded in your bill data, the Knowledge Center, and any bill/PDF "
+                   "you've uploaded this session.")
+        if st.button("✨ Generate AI Suggestions", type="primary"):
+            with st.spinner("Asking the AI advisor..."):
+                bill_for_llm = st.session_state.bill_data or ai_extract_bill(None)
+                result = ai_llm_savings_suggestions(bill_for_llm, recs)
+            if result:
+                text, sources = result
+                st.markdown(f'<div class="evidence-box">{text}</div>', unsafe_allow_html=True)
+                if sources:
+                    st.markdown(
+                        "".join(f'<span class="source-chip">📚 {s}</span>' for s in set(sources)),
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.warning("Couldn't generate an AI plan right now — showing the calculated "
+                           "plan above instead. Check your API key in Settings.")
 
 # ----------------------------------------------------------------------
 # PAGE: SAVINGS SIMULATOR
@@ -1270,6 +1396,6 @@ elif page == "⚙️ Settings":
         st.success("Saved for this session.")
 
     if get_groq_client() is not None:
-        st.caption("✅ A key is currently active (session or GROQ_API_KEY environment variable).")
+        st.caption("✅ A key is currently active (session input, GROQ_API_KEY env var, or Streamlit secrets).")
     else:
         st.caption("⚪ No active key — chat will use retrieval-only answers.")
